@@ -18,9 +18,12 @@ import torch
 import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
+from torch_utils import misc
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
+
+PRED_EPS = {}
 
 def edm_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
@@ -34,10 +37,10 @@ def edm_sampler(
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
-    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])])  # add t_N = 0
 
     # Main sampling loop.
-    x_next = latents.to(torch.float64) * t_steps[0]
+    x_next = latents.to(torch.float64) * t_steps[0]  # x_T
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
         x_cur = x_next
 
@@ -48,6 +51,25 @@ def edm_sampler(
 
         # Euler step.
         denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+
+        # compute the eps l2-norm for each image
+        pred_eps = (x_hat - denoised) / t_hat
+        pred_eps = pred_eps.contiguous().cpu().numpy()
+        l2_norms = []
+        for n in range(pred_eps.shape[0]):
+            image = pred_eps[n, :, :, :]
+            image = image.reshape(3, -1)
+            l2_norm = np.linalg.norm(image, 'fro')
+            l2_norms.append(l2_norm)
+        eps_l2_norm = (sum(l2_norms) / len(l2_norms))
+        eps_l2_norm = np.array(eps_l2_norm).reshape([1])
+        if str(t_hat) in PRED_EPS.keys():
+            PRED_EPS[str(t_hat)] = np.concatenate((PRED_EPS[str(t_hat)], eps_l2_norm), axis=0)
+        else:
+            PRED_EPS[str(t_hat)] = eps_l2_norm
+        dist.print0(f"store eps L2-norm: {eps_l2_norm} at {str(t_hat)}")
+
+
         d_cur = (x_hat - denoised) / t_hat
         x_next = x_hat + (t_next - t_hat) * d_cur
 
@@ -56,6 +78,51 @@ def edm_sampler(
             denoised = net(x_next, t_next, class_labels).to(torch.float64)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+    return x_next
+
+
+def edm_single_step_sampler(
+    net, x_t, i, t_cur, t_next, class_labels=None, randn_like=torch.randn_like,
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+):
+    # one-step prediction
+    x_cur = x_t
+
+    # Increase noise temporarily.
+    gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+    t_hat = net.round_sigma(t_cur + gamma * t_cur)
+    x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+
+    # Euler step.
+    denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+
+    # compute the eps l2-norm for each image
+    pred_eps = (x_hat - denoised) / t_hat
+    pred_eps = pred_eps.contiguous().cpu().numpy()
+    l2_norms = []
+    for n in range(pred_eps.shape[0]):
+        image = pred_eps[n, :, :, :]
+        image = image.reshape(3, -1)
+        l2_norm = np.linalg.norm(image, 'fro')
+        l2_norms.append(l2_norm)
+    eps_l2_norm = (sum(l2_norms) / len(l2_norms))
+    eps_l2_norm = np.array(eps_l2_norm).reshape([1])
+    if str(t_hat) in PRED_EPS.keys():
+        PRED_EPS[str(t_hat)] = np.concatenate((PRED_EPS[str(t_hat)], eps_l2_norm), axis=0)
+    else:
+        PRED_EPS[str(t_hat)] = eps_l2_norm
+    dist.print0(f"store eps L2-norm: {eps_l2_norm} at t {t_hat}")
+
+    d_cur = (x_hat - denoised) / t_hat
+    x_next = x_hat + (t_next - t_hat) * d_cur
+
+    # Apply 2nd order correction.
+    if i < num_steps - 1:
+        denoised = net(x_next, t_next, class_labels).to(torch.float64)
+        d_prime = (x_next - denoised) / t_next
+        x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
     return x_next
 
@@ -269,40 +336,68 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     if dist.get_rank() == 0:
         torch.distributed.barrier()
 
-    # Loop over batches.
-    dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
-    for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
-        torch.distributed.barrier()
-        batch_size = len(batch_seeds)
-        if batch_size == 0:
-            continue
+    # Load dataset.
+    dataset_path = 'datasets/cifar10-32x32.zip'
+    dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=dataset_path,
+                                       use_labels=False, xflip=False, cache=True)
+    data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=1, prefetch_factor=2)
+    dist.print0(f'Loading dataset: {dataset_path}...')
+    dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)  # subclass of training.dataset.Dataset
+    dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(),
+                                           num_replicas=dist.get_world_size())
+    dataset_iterator = iter(
+        torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=max_batch_size,
+                                    **data_loader_kwargs))
 
-        # Pick latents and labels.
-        rnd = StackedRandomGenerator(device, batch_seeds)
-        latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
-        class_labels = None
-        if net.label_dim:
-            class_labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[batch_size], device=device)]
-        if class_idx is not None:
-            class_labels[:, :] = 0
-            class_labels[:, class_idx] = 1
+    # Time step discretization.
+    rho = 7
+    num_steps = 18
+    sigma_min = max(0.002, net.sigma_min)
+    sigma_max = min(80, net.sigma_max)
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
+    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (
+                sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])])  # add t_N = 0
 
-        # Generate images.
-        sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
-        have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-        sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+    # for each t, compute eps l2-norm using 50k samples
+    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
+        dist.print0(f'computing eps l2-norm for t: {t_cur.cpu().numpy()} using {len(seeds)} samples "{outdir}"...')
 
-        # Save images.
-        images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
-        for seed, image_np in zip(batch_seeds, images_np):
-            image_dir = os.path.join(outdir, f'{seed-seed%1000:06d}') if subdirs else outdir
-            os.makedirs(image_dir, exist_ok=True)
-            image_path = os.path.join(image_dir, f'{seed:06d}.png')
-            if image_np.shape[2] == 1:
-                PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
-            else:
-                PIL.Image.fromarray(image_np, 'RGB').save(image_path)
+        for batch_seeds in rank_batches:
+            torch.distributed.barrier()
+            batch_size = len(batch_seeds)
+            if batch_size == 0:
+                continue
+
+            # x_t
+            images, labels = next(dataset_iterator)
+            images = images.to(device).to(torch.float32) / 127.5 - 1
+            labels = labels.to(device)
+            n = torch.randn_like(images) * t_cur
+            x_t = images + n
+
+            # Pick latents and labels.
+            rnd = StackedRandomGenerator(device, batch_seeds)
+            # latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
+            class_labels = None
+            if net.label_dim:
+                class_labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[batch_size], device=device)]
+            if class_idx is not None:
+                class_labels[:, :] = 0
+                class_labels[:, class_idx] = 1
+
+            # Generate images (default sampler: EDM ODE 2nd Heun sampler)
+            sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
+            have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
+            sampler_fn = ablation_sampler if have_ablation_kwargs else edm_single_step_sampler
+            denoised = sampler_fn(net, x_t, i, t_cur, t_next, class_labels, **sampler_kwargs)
+
+    # L2-norm of eps
+    l2_norms_ls = []
+    for t in PRED_EPS:
+        l2_norms_ls.append(PRED_EPS[t].mean())
+        dist.print0(f"avg eps l2 norm at {t} step: {PRED_EPS[t].mean()}")
+    dist.print0(f"eps l2 norm: {np.array(l2_norms_ls[::-1]).tolist()}")
 
     # Done.
     torch.distributed.barrier()
