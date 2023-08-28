@@ -22,6 +22,9 @@ from torch_utils import distributed as dist
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
 
+PRED_EPS = {}
+PRED_EPS_COR = {}
+
 def edm_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
@@ -30,14 +33,15 @@ def edm_sampler(
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
+    dist.print0(f"heun sampler steps: {num_steps*2-1}")
 
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
-    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])])  # add t_N = 0
 
     # Main sampling loop.
-    x_next = latents.to(torch.float64) * t_steps[0]
+    x_next = latents.to(torch.float64) * t_steps[0]  # x_T
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
         x_cur = x_next
 
@@ -48,12 +52,49 @@ def edm_sampler(
 
         # Euler step.
         denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+
+        # compute the eps l2-norm for each image
+        pred_eps = (x_hat - denoised) / t_hat
+        pred_eps = pred_eps.contiguous().cpu().numpy()
+        l2_norms = []
+        for n in range(pred_eps.shape[0]):
+            image = pred_eps[n, :, :, :]
+            image = image.reshape(3, -1)
+            l2_norm = np.linalg.norm(image, 'fro')
+            l2_norms.append(l2_norm)
+        eps_l2_norm = (sum(l2_norms) / len(l2_norms))
+        eps_l2_norm = np.array(eps_l2_norm).reshape([1])
+        if str(t_hat) in PRED_EPS.keys():
+            PRED_EPS[str(t_hat)] = np.concatenate((PRED_EPS[str(t_hat)], eps_l2_norm), axis=0)
+        else:
+            PRED_EPS[str(t_hat)] = eps_l2_norm
+        dist.print0(f"store eps L2-norm: {eps_l2_norm} at Euler {t_hat}")
+
+
         d_cur = (x_hat - denoised) / t_hat
         x_next = x_hat + (t_next - t_hat) * d_cur
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
             denoised = net(x_next, t_next, class_labels).to(torch.float64)
+
+            # compute the eps l2-norm for each image
+            pred_eps = (x_next - denoised) / t_next
+            pred_eps = pred_eps.contiguous().cpu().numpy()
+            l2_norms = []
+            for n in range(pred_eps.shape[0]):
+                image = pred_eps[n, :, :, :]
+                image = image.reshape(3, -1)
+                l2_norm = np.linalg.norm(image, 'fro')
+                l2_norms.append(l2_norm)
+            eps_l2_norm = (sum(l2_norms) / len(l2_norms))
+            eps_l2_norm = np.array(eps_l2_norm).reshape([1])
+            if str(t_next) in PRED_EPS_COR.keys():
+                PRED_EPS_COR[str(t_next)] = np.concatenate((PRED_EPS_COR[str(t_next)], eps_l2_norm), axis=0)
+            else:
+                PRED_EPS_COR[str(t_next)] = eps_l2_norm
+            dist.print0(f"store eps L2-norm: {eps_l2_norm} at Correction {t_next}")
+
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
@@ -287,7 +328,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
             class_labels[:, :] = 0
             class_labels[:, class_idx] = 1
 
-        # Generate images.
+        # Generate images (default sampler: EDM ODE 2nd Heun sampler)
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
         have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
@@ -303,6 +344,19 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
                 PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
             else:
                 PIL.Image.fromarray(image_np, 'RGB').save(image_path)
+
+    # L2-norm of eps
+    l2_norms_ls = []
+    for t in PRED_EPS:
+        l2_norms_ls.append(PRED_EPS[t].mean())
+        dist.print0(f"avg eps l2 norm at {t} euler step: {PRED_EPS[t].mean()}")
+    dist.print0(f"eps l2 norm: {np.array(l2_norms_ls[::-1]).tolist()}")
+
+    l2_norms_ls = []
+    for t in PRED_EPS_COR:
+        l2_norms_ls.append(PRED_EPS_COR[t].mean())
+        dist.print0(f"avg eps l2 norm at {t} correction step: {PRED_EPS_COR[t].mean()}")
+    dist.print0(f"eps l2 norm: {np.array(l2_norms_ls[::-1]).tolist()}")
 
     # Done.
     torch.distributed.barrier()
