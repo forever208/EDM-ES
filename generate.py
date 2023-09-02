@@ -25,11 +25,12 @@ from torch_utils import distributed as dist
 def edm_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
-    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1, eps_scaler=1.0
 ):
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
+    dist.print0(f'sampling steps: {num_steps*2-1}')
 
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
@@ -48,12 +49,26 @@ def edm_sampler(
 
         # Euler step.
         denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+
+        # epsilon scaling
+        pred_eps = (x_hat - denoised) / t_hat
+        dist.print0(f'using scaler: "{eps_scaler}" at Euler step')
+        pred_eps = pred_eps / eps_scaler
+        denoised = x_hat - pred_eps * t_hat
+
         d_cur = (x_hat - denoised) / t_hat
         x_next = x_hat + (t_next - t_hat) * d_cur
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
             denoised = net(x_next, t_next, class_labels).to(torch.float64)
+
+            # epsilon scaling
+            pred_eps = (x_next - denoised) / t_next
+            dist.print0(f'using scaler: "{eps_scaler}" at correction step')
+            pred_eps = pred_eps / eps_scaler
+            denoised = x_next - pred_eps * t_next
+
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
@@ -68,12 +83,13 @@ def ablation_sampler(
     num_steps=18, sigma_min=None, sigma_max=None, rho=7,
     solver='heun', discretization='edm', schedule='linear', scaling='none',
     epsilon_s=1e-3, C_1=0.001, C_2=0.008, M=1000, alpha=1,
-    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1, eps_scaler=1.0,
 ):
     assert solver in ['euler', 'heun']
     assert discretization in ['vp', 've', 'iddpm', 'edm']
     assert schedule in ['vp', 've', 'linear']
     assert scaling in ['vp', 'none']
+    dist.print0(f'sampling steps: {num_steps}')
 
     # Helper functions for VP & VE noise level schedules.
     vp_sigma = lambda beta_d, beta_min: lambda t: (np.e ** (0.5 * beta_d * (t ** 2) + beta_min * t) - 1) ** 0.5
@@ -160,6 +176,13 @@ def ablation_sampler(
         # Euler step.
         h = t_next - t_hat
         denoised = net(x_hat / s(t_hat), sigma(t_hat), class_labels).to(torch.float64)
+
+        # epsilon scaling
+        pred_eps = (x_hat - denoised) / sigma(t_hat)
+        dist.print0(f'ablation sampler: using scaler {eps_scaler} at Euler step')
+        pred_eps = pred_eps / eps_scaler
+        denoised = x_hat - pred_eps * sigma(t_hat)
+
         d_cur = (sigma_deriv(t_hat) / sigma(t_hat) + s_deriv(t_hat) / s(t_hat)) * x_hat - sigma_deriv(t_hat) * s(t_hat) / sigma(t_hat) * denoised
         x_prime = x_hat + alpha * h * d_cur
         t_prime = t_hat + alpha * h
@@ -220,6 +243,7 @@ def parse_int_list(s):
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
 @click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
 @click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--eps_scaler', 'eps_scaler',help='epsilon scaler',         metavar='FLOAT',                          type=float, default=1.0, show_default=True)
 
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
@@ -235,7 +259,7 @@ def parse_int_list(s):
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, eps_scaler, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -291,7 +315,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
         have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, eps_scaler=eps_scaler, **sampler_kwargs)
 
         # Save images.
         images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
@@ -303,6 +327,8 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
                 PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
             else:
                 PIL.Image.fromarray(image_np, 'RGB').save(image_path)
+
+        dist.print0(f'Generated {max_batch_size} images...')
 
     # Done.
     torch.distributed.barrier()
