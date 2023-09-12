@@ -24,6 +24,7 @@ from torch_utils import misc
 # Proposed EDM sampler (Algorithm 2).
 
 PRED_EPS = {}
+PRED_EPS_COR = {}
 
 def edm_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
@@ -87,7 +88,7 @@ def edm_single_step_sampler(
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
-    # one-step prediction
+    dist.print0(f"heun sampler steps: {num_steps*2-1}")
     x_cur = x_t
 
     # Increase noise temporarily.
@@ -113,7 +114,7 @@ def edm_single_step_sampler(
         PRED_EPS[str(t_hat)] = np.concatenate((PRED_EPS[str(t_hat)], eps_l2_norm), axis=0)
     else:
         PRED_EPS[str(t_hat)] = eps_l2_norm
-    dist.print0(f"store eps L2-norm: {eps_l2_norm} at t {t_hat}")
+    dist.print0(f"store eps L2-norm: {eps_l2_norm} at euler: {t_hat}")
 
     d_cur = (x_hat - denoised) / t_hat
     x_next = x_hat + (t_next - t_hat) * d_cur
@@ -121,6 +122,24 @@ def edm_single_step_sampler(
     # Apply 2nd order correction.
     if i < num_steps - 1:
         denoised = net(x_next, t_next, class_labels).to(torch.float64)
+
+        # compute the eps l2-norm for each image
+        pred_eps = (x_next - denoised) / t_next
+        pred_eps = pred_eps.contiguous().cpu().numpy()
+        l2_norms = []
+        for n in range(pred_eps.shape[0]):
+            image = pred_eps[n, :, :, :]
+            image = image.reshape(3, -1)
+            l2_norm = np.linalg.norm(image, 'fro')
+            l2_norms.append(l2_norm)
+        eps_l2_norm = (sum(l2_norms) / len(l2_norms))
+        eps_l2_norm = np.array(eps_l2_norm).reshape([1])
+        if str(t_next) in PRED_EPS_COR.keys():
+            PRED_EPS_COR[str(t_next)] = np.concatenate((PRED_EPS_COR[str(t_next)], eps_l2_norm), axis=0)
+        else:
+            PRED_EPS_COR[str(t_next)] = eps_l2_norm
+        dist.print0(f"store eps L2-norm: {eps_l2_norm} at correction: {t_next}")
+
         d_prime = (x_next - denoised) / t_next
         x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
@@ -351,7 +370,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
 
     # Time step discretization.
     rho = 7
-    num_steps = 18
+    num_steps = 11
     sigma_min = max(0.002, net.sigma_min)
     sigma_max = min(80, net.sigma_max)
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
@@ -361,7 +380,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
 
     # for each t, compute eps l2-norm using 50k samples
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
-        dist.print0(f'computing eps l2-norm for t: {t_cur.cpu().numpy()} using {len(seeds)} samples "{outdir}"...')
+        dist.print0(f'computing eps l2-norm for t: {t_cur.cpu().numpy()} using {len(seeds)} samples...')
 
         for batch_seeds in rank_batches:
             torch.distributed.barrier()
@@ -396,7 +415,13 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     l2_norms_ls = []
     for t in PRED_EPS:
         l2_norms_ls.append(PRED_EPS[t].mean())
-        dist.print0(f"avg eps l2 norm at {t} step: {PRED_EPS[t].mean()}")
+        dist.print0(f"avg eps l2 norm at Euler step {t}: {PRED_EPS[t].mean()}")
+    dist.print0(f"eps l2 norm: {np.array(l2_norms_ls[::-1]).tolist()}")
+
+    l2_norms_ls = []
+    for t in PRED_EPS_COR:
+        l2_norms_ls.append(PRED_EPS_COR[t].mean())
+        dist.print0(f"avg eps l2 norm at Correction step {t}: {PRED_EPS_COR[t].mean()}")
     dist.print0(f"eps l2 norm: {np.array(l2_norms_ls[::-1]).tolist()}")
 
     # Done.
