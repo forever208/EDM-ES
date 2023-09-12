@@ -115,6 +115,7 @@ def ablation_sampler(
     assert discretization in ['vp', 've', 'iddpm', 'edm']
     assert schedule in ['vp', 've', 'linear']
     assert scaling in ['vp', 'none']
+    dist.print0(f"using {solver} sampler steps: {num_steps}")
 
     # Helper functions for VP & VE noise level schedules.
     vp_sigma = lambda beta_d, beta_min: lambda t: (np.e ** (0.5 * beta_d * (t ** 2) + beta_min * t) - 1) ** 0.5
@@ -201,6 +202,24 @@ def ablation_sampler(
         # Euler step.
         h = t_next - t_hat
         denoised = net(x_hat / s(t_hat), sigma(t_hat), class_labels).to(torch.float64)
+
+        # compute the eps l2-norm for each image
+        pred_eps = (x_hat / s(t_hat) - denoised) / sigma(t_hat)
+        pred_eps = pred_eps.contiguous().cpu().numpy()
+        l2_norms = []
+        for n in range(pred_eps.shape[0]):
+            image = pred_eps[n, :, :, :]
+            image = image.reshape(3, -1)
+            l2_norm = np.linalg.norm(image, 'fro')
+            l2_norms.append(l2_norm)
+        eps_l2_norm = (sum(l2_norms) / len(l2_norms))
+        eps_l2_norm = np.array(eps_l2_norm).reshape([1])
+        if str(t_hat) in PRED_EPS.keys():
+            PRED_EPS[str(t_hat)] = np.concatenate((PRED_EPS[str(t_hat)], eps_l2_norm), axis=0)
+        else:
+            PRED_EPS[str(t_hat)] = eps_l2_norm
+        dist.print0(f"store eps L2-norm: {eps_l2_norm} at Euler {t_hat}")
+
         d_cur = (sigma_deriv(t_hat) / sigma(t_hat) + s_deriv(t_hat) / s(t_hat)) * x_hat - sigma_deriv(t_hat) * s(t_hat) / sigma(t_hat) * denoised
         x_prime = x_hat + alpha * h * d_cur
         t_prime = t_hat + alpha * h
