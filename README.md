@@ -1,121 +1,66 @@
-## Elucidating the Design Space of Diffusion-Based Generative Models (EDM)<br><sub>Official PyTorch implementation of the NeurIPS 2022 paper</sub>
+## Elucidating the Exposure Bias in Diffusion Models
+This is the codebase for our paper **Elucidating the Exposure Bias in Diffusion Models**
+<br>https://arxiv.org/abs/2308.15321
 
-![Teaser image](./docs/teaser-1920x640.jpg)
+The repository is heavily based on [EDM](https://github.com/NVlabs/edm) with the sampling solution **Epsion Scaling** (EDM-ES) 
+Feel free to check out our Epsilon Scaling repository for ADM: [ADM-ES](https://github.com/forever208/ADM-ES) 
 
-**Elucidating the Design Space of Diffusion-Based Generative Models**<br>
-Tero Karras, Miika Aittala, Timo Aila, Samuli Laine
-<br>https://arxiv.org/abs/2206.00364<br>
 
-Abstract: *We argue that the theory and practice of diffusion-based generative models are currently unnecessarily convoluted and seek to remedy the situation by presenting a design space that clearly separates the concrete design choices. This lets us identify several changes to both the sampling and training processes, as well as preconditioning of the score networks. Together, our improvements yield new state-of-the-art FID of 1.79 for CIFAR-10 in a class-conditional setting and 1.97 in an unconditional setting, with much faster sampling (35 network evaluations per image) than prior designs. To further demonstrate their modular nature, we show that our design changes dramatically improve both the efficiency and quality obtainable with pre-trained score networks from previous work, including improving the FID of a previously trained ImageNet-64 model from 2.07 to near-SOTA 1.55, and after re-training with our proposed improvements to a new SOTA of 1.36.*
 
-For business inquiries, please visit our website and submit the form: [NVIDIA Research Licensing](https://www.nvidia.com/en-us/research/inquiries/)
-
-## Requirements
-
+## Installsation
+The installation is the same as EDM
 * Linux and Windows are supported, but we recommend Linux for performance and compatibility reasons.
 * 1+ high-end NVIDIA GPU for sampling and 8+ GPUs for training. We have done all testing and development using V100 and A100 GPUs.
-* 64-bit Python 3.8 and PyTorch 1.12.0 (or later). See https://pytorch.org for PyTorch install instructions.
-* Python libraries: See [environment.yml](./environment.yml) for exact library dependencies. You can use the following commands with Miniconda3 to create and activate your Python environment:
+* Python 3.8 and PyTorch 1.12.0 are recommended
+* Python libraries: See [environment.yml](./environment.yml) for exact library dependencies. You can use the following commands with Anaconda to create and activate your Python environment:
   - `conda env create -f environment.yml -n edm`
   - `conda activate edm`
-* Docker users:
-  - Ensure you have correctly installed the [NVIDIA container runtime](https://docs.docker.com/config/containers/resource_constraints/#gpu).
-  - Use the [provided Dockerfile](./Dockerfile) to build an image with the required library dependencies.
 
-## Getting started
 
-To reproduce the main results from our paper, simply run:
-
-```.bash
-python example.py
-```
-
-This is a minimal standalone script that loads the best pre-trained model for each dataset and generates a random 8x8 grid of images using the optimal sampler settings. Expected results:
-
-| Dataset  | Runtime | Reference image
-| :------- | :------ | :--------------
-| CIFAR-10 | ~6 sec  | [`cifar10-32x32.png`](./docs/cifar10-32x32.png)
-| FFHQ     | ~28 sec | [`ffhq-64x64.png`](./docs/ffhq-64x64.png)
-| AFHQv2   | ~28 sec | [`afhqv2-64x64.png`](./docs/afhqv2-64x64.png)
-| ImageNet | ~5 min  | [`imagenet-64x64.png`](./docs/imagenet-64x64.png)
-
-The easiest way to explore different sampling strategies is to modify [`example.py`](./example.py) directly. You can also incorporate the pre-trained models and/or our proposed EDM sampler in your own code by simply copy-pasting the relevant bits. Note that the class definitions for the pre-trained models are stored within the pickles themselves and loaded automatically during unpickling via [`torch_utils.persistence`](./torch_utils/persistence.py). To use the models in external Python scripts, just make sure that `torch_utils` and `dnnlib` are accesible through `PYTHONPATH`.
-
-**Docker**: You can run the example script using Docker as follows:
-
-```.bash
-# Build the edm:latest image
-docker build --tag edm:latest .
-
-# Run the generate.py script using Docker:
-docker run --gpus all -it --rm --user $(id -u):$(id -g) \
-    -v `pwd`:/scratch --workdir /scratch -e HOME=/scratch \
-    edm:latest \
-    python example.py
-```
-
-Note: The Docker image requires NVIDIA driver release `r520` or later.
-
-The `docker run` invocation may look daunting, so let's unpack its contents here:
-
-- `--gpus all -it --rm --user $(id -u):$(id -g)`: with all GPUs enabled, run an interactive session with current user's UID/GID to avoid Docker writing files as root.
-- ``-v `pwd`:/scratch --workdir /scratch``: mount current running dir (e.g., the top of this git repo on your host machine) to `/scratch` in the container and use that as the current working dir.
-- `-e HOME=/scratch`: specify where to cache temporary files. Note: if you want more fine-grained control, you can instead set `DNNLIB_CACHE_DIR` (for pre-trained model download cache). You want these cache dirs to reside on persistent volumes so that their contents are retained across multiple `docker run` invocations.
-
-## Pre-trained models
-
-We provide pre-trained models for our proposed training configuration (config F) as well as the baseline configuration (config A):
+## Download Pre-trained models
+Since EDM-ES is a ssampling solution, we use the pre-trained models from EDM without any change.
+EDM provides pre-trained models below:
 
 - [https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/](https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/)
 - [https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/](https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/)
 
-To generate a batch of images using a given model and sampler, run:
 
+## Generating images
+Epsilon Scaling is implemented in `generate.py` script.
+<br> `--eps_scaler=1.0` correcponds to the EDM baseline.
+<br>The default ODE sampler is Heun 2nd order sampler.
+
+
+For example, using EDM-ES to generate 50000 images (set --seeds=0-49999) with 35-step Heun sampler:
 ```.bash
-# Generate 64 images and save them as out/*.png
-python generate.py --outdir=out --seeds=0-63 --batch=64 \
+torchrun --standalone --nnodes=1 --nproc_per_node=1 generate.py \
+    --outdir=out --batch 512 --steps=18 --seeds=0-49999 \
+    --eps_scaler=1.0006 \
     --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
 ```
 
-Generating a large number of images can be time-consuming; the workload can be distributed across multiple GPUs by launching the above command using `torchrun`:
-
+using EDM-ES to generate 50000 images (set --seeds=0-49999) with 13-step Euler sampler:
 ```.bash
-# Generate 1024 images using 2 GPUs
-torchrun --standalone --nproc_per_node=2 generate.py --outdir=out --seeds=0-999 --batch=64 \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+torchrun --standalone --nnodes=1 --nproc_per_node=1 generate.py \
+    --outdir=out --batch 512 --steps=13 --seeds=0-49999 --solver=euler \
+    --eps_scaler=1.0048 \
+    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl
 ```
 
-The sampler settings can be controlled through command-line options; see [`python generate.py --help`](./docs/generate-help.txt) for more information. For best results, we recommend using the following settings for each dataset:
+The full parameter settings of `--eps_scaler` is shown below:
 
-```.bash
-# For CIFAR-10 at 32x32, use deterministic sampling with 18 steps (NFE = 35)
-python generate.py --outdir=out --steps=18 \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+<p align="left">
+  <img src="./docs/eps_scaler.png" width='55%' height='55%'/>
+</p>
 
-# For FFHQ and AFHQv2 at 64x64, use deterministic sampling with 40 steps (NFE = 79)
-python generate.py --outdir=out --steps=40 \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
 
-# For ImageNet at 64x64, use stochastic sampling with 256 steps (NFE = 511)
-python generate.py --outdir=out --steps=256 --S_churn=40 --S_min=0.05 --S_max=50 --S_noise=1.003 \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl
-```
+## Trajectory of Epsilon L2-norm  
+If you want to plot the Epsilon L2-norm (similar to Fig. 6 in the paper), checkout into branch `eps_norm_consecutive_sampling` and `eps_norm_single_step_sampling`.
+In which the former compute the Epsilon L2-norm during regular sampling, while the latter compute the Epsilon L2-norm during training (more specifically, given a well-trained model)
 
-Besides our proposed EDM sampler, `generate.py` can also be used to reproduce the sampler ablations from Section 3 of our paper. For example:
-
-```.bash
-# Figure 2a, "Our reimplementation"
-python generate.py --outdir=out --steps=512 --solver=euler --disc=vp --schedule=vp --scaling=vp \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/baseline-cifar10-32x32-uncond-vp.pkl
-
-# Figure 2a, "+ Heun & our {t_i}"
-python generate.py --outdir=out --steps=128 --solver=heun --disc=edm --schedule=vp --scaling=vp \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/baseline-cifar10-32x32-uncond-vp.pkl
-
-# Figure 2a, "+ Our sigma(t) & s(t)"
-python generate.py --outdir=out --steps=18 --solver=heun --disc=edm --schedule=linear --scaling=none \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/baseline-cifar10-32x32-uncond-vp.pkl
-```
+<p align="left">
+  <img src="./docs/figure_6.png" width='100%' height='100%'/>
+</p>
 
 ## Calculating FID
 
@@ -183,64 +128,24 @@ python dataset_tool.py --source=downloads/imagenet/ILSVRC/Data/CLS-LOC/train \
 python fid.py ref --data=datasets/imagenet-64x64.zip --dest=fid-refs/imagenet-64x64.npz
 ```
 
-## Training new models
-
-You can train new models using `train.py`. For example:
-
-```.bash
-# Train DDPM++ model for class-conditional CIFAR-10 using 8 GPUs
-torchrun --standalone --nproc_per_node=8 train.py --outdir=training-runs \
-    --data=datasets/cifar10-32x32.zip --cond=1 --arch=ddpmpp
-```
-
-The above example uses the default batch size of 512 images (controlled by `--batch`) that is divided evenly among 8 GPUs (controlled by `--nproc_per_node`) to yield 64 images per GPU. Training large models may run out of GPU memory; the best way to avoid this is to limit the per-GPU batch size, e.g., `--batch-gpu=32`. This employs gradient accumulation to yield the same results as using full per-GPU batches. See [`python train.py --help`](./docs/train-help.txt) for the full list of options.
-
-The results of each training run are saved to a newly created directory, for example `training-runs/00000-cifar10-cond-ddpmpp-edm-gpus8-batch64-fp32`. The training loop exports network snapshots (`network-snapshot-*.pkl`) and training states (`training-state-*.pt`) at regular intervals (controlled by `--snap` and `--dump`). The network snapshots can be used to generate images with `generate.py`, and the training states can be used to resume the training later on (`--resume`). Other useful information is recorded in `log.txt` and `stats.jsonl`. To monitor training convergence, we recommend looking at the training loss (`"Loss/loss"` in `stats.jsonl`) as well as periodically evaluating FID for `network-snapshot-*.pkl` using `generate.py` and `fid.py`.
-
-The following table lists the exact training configurations that we used to obtain our pre-trained models:
-
-| <sub>Model</sub> | <sub>GPUs</sub> | <sub>Time</sub> | <sub>Options</sub>
-| :-- | :-- | :-- | :--
-| <sub>cifar10&#8209;32x32&#8209;cond&#8209;vp</sub>   | <sub>8xV100</sub>  | <sub>~2&nbsp;days</sub>  | <sub>`--cond=1 --arch=ddpmpp`</sub>
-| <sub>cifar10&#8209;32x32&#8209;cond&#8209;ve</sub>   | <sub>8xV100</sub>  | <sub>~2&nbsp;days</sub>  | <sub>`--cond=1 --arch=ncsnpp`</sub>
-| <sub>cifar10&#8209;32x32&#8209;uncond&#8209;vp</sub> | <sub>8xV100</sub>  | <sub>~2&nbsp;days</sub>  | <sub>`--cond=0 --arch=ddpmpp`</sub>
-| <sub>cifar10&#8209;32x32&#8209;uncond&#8209;ve</sub> | <sub>8xV100</sub>  | <sub>~2&nbsp;days</sub>  | <sub>`--cond=0 --arch=ncsnpp`</sub>
-| <sub>ffhq&#8209;64x64&#8209;uncond&#8209;vp</sub>    | <sub>8xV100</sub>  | <sub>~4&nbsp;days</sub>  | <sub>`--cond=0 --arch=ddpmpp --batch=256 --cres=1,2,2,2 --lr=2e-4 --dropout=0.05 --augment=0.15`</sub>
-| <sub>ffhq&#8209;64x64&#8209;uncond&#8209;ve</sub>    | <sub>8xV100</sub>  | <sub>~4&nbsp;days</sub>  | <sub>`--cond=0 --arch=ncsnpp --batch=256 --cres=1,2,2,2 --lr=2e-4 --dropout=0.05 --augment=0.15`</sub>
-| <sub>afhqv2&#8209;64x64&#8209;uncond&#8209;vp</sub>  | <sub>8xV100</sub>  | <sub>~4&nbsp;days</sub>  | <sub>`--cond=0 --arch=ddpmpp --batch=256 --cres=1,2,2,2 --lr=2e-4 --dropout=0.25 --augment=0.15`</sub>
-| <sub>afhqv2&#8209;64x64&#8209;uncond&#8209;ve</sub>  | <sub>8xV100</sub>  | <sub>~4&nbsp;days</sub>  | <sub>`--cond=0 --arch=ncsnpp --batch=256 --cres=1,2,2,2 --lr=2e-4 --dropout=0.25 --augment=0.15`</sub>
-| <sub>imagenet&#8209;64x64&#8209;cond&#8209;adm</sub> | <sub>32xA100</sub> | <sub>~13&nbsp;days</sub> | <sub>`--cond=1 --arch=adm --duration=2500 --batch=4096 --lr=1e-4 --ema=50 --dropout=0.10 --augment=0 --fp16=1 --ls=100 --tick=200`</sub>
-
-For ImageNet-64, we ran the training on four NVIDIA DGX A100 nodes, each containing 8 Ampere GPUs with 80 GB of memory. To reduce the GPU memory requirements, we recommend either training the model with more GPUs or limiting the per-GPU batch size with `--batch-gpu`. To set up multi-node training, please consult the [torchrun documentation](https://pytorch.org/docs/stable/elastic/run.html).
-
-## License
-
-Copyright &copy; 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-All material, including source code and pre-trained models, is licensed under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](http://creativecommons.org/licenses/by-nc-sa/4.0/).
-
-`baseline-cifar10-32x32-uncond-vp.pkl` and `baseline-cifar10-32x32-uncond-ve.pkl` are derived from the [pre-trained models](https://github.com/yang-song/score_sde_pytorch) by Yang Song, Jascha Sohl-Dickstein, Diederik P. Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. The models were originally shared under the [Apache 2.0 license](https://github.com/yang-song/score_sde_pytorch/blob/main/LICENSE).
-
-`baseline-imagenet-64x64-cond-adm.pkl` is derived from the [pre-trained model](https://github.com/openai/guided-diffusion) by Prafulla Dhariwal and Alex Nichol. The model was originally shared under the [MIT license](https://github.com/openai/guided-diffusion/blob/main/LICENSE).
-
-`imagenet-64x64-baseline.npz` is derived from the [precomputed reference statistics](https://github.com/openai/guided-diffusion/tree/main/evaluations) by Prafulla Dhariwal and Alex Nichol. The statistics were
-originally shared under the [MIT license](https://github.com/openai/guided-diffusion/blob/main/LICENSE).
 
 ## Citation
 
 ```
-@inproceedings{Karras2022edm,
-  author    = {Tero Karras and Miika Aittala and Timo Aila and Samuli Laine},
-  title     = {Elucidating the Design Space of Diffusion-Based Generative Models},
-  booktitle = {Proc. NeurIPS},
-  year      = {2022}
+@article{ning2023elucidating,
+  title={Elucidating the Exposure Bias in Diffusion Models},
+  author={Ning, Mang and Li, Mingxiao and Su, Jianlin and Salah, Albert Ali and Ertugrul, Itir Onal},
+  journal={arXiv preprint arXiv:2308.15321},
+  year={2023}
 }
 ```
 
-## Development
-
-This is a research reference implementation and is treated as a one-time code drop. As such, we do not accept outside code contributions in the form of pull requests.
-
-## Acknowledgments
-
-We thank Jaakko Lehtinen, Ming-Yu Liu, Tuomas Kynk&auml;&auml;nniemi, Axel Sauer, Arash Vahdat, and Janne Hellsten for discussions and comments, and Tero Kuosmanen, Samuel Klenberg, and Janne Hellsten for maintaining our compute infrastructure.
+If you want to know our training solution to exposure bias, feel free to checkout our ICML 2023 paper and [repository](https://github.com/forever208/DDPM-IP):
+```
+@article{ning2023input,
+  title={Input Perturbation Reduces Exposure Bias in Diffusion Models},
+  author={Ning, Mang and Sangineto, Enver and Porrello, Angelo and Calderara, Simone and Cucchiara, Rita},
+  journal={arXiv preprint arXiv:2301.11706},
+  year={2023}
+}
+```
